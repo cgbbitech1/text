@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitHub Text Editor</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #5d6675;
+    --border: #d5dae1; --accent: #2563eb; --ok: #15803d; --err: #b91c1c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171c; --panel: #1d2128; --text: #e6e9ee; --muted: #9aa3b0;
+            --border: #333a44; --accent: #60a5fa; --ok: #4ade80; --err: #f87171; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  main { max-width: 1000px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; margin: 4px 0 14px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin-bottom: 12px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 3px; }
+  input[type=text], input[type=password], textarea {
+    width: 100%; padding: 8px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--bg); color: var(--text); font: inherit; }
+  textarea { min-height: 55vh; font: 14px/1.5 ui-monospace, Consolas, monospace; resize: vertical; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+  button { padding: 8px 16px; border: 0; border-radius: 6px; background: var(--accent);
+           color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+  #status { font-size: 14px; color: var(--muted); }
+  #status.ok { color: var(--ok); } #status.err { color: var(--err); }
+  .check { display: flex; gap: 6px; align-items: center; font-size: 13px; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>GitHub Text Editor</h1>
+
+  <div class="panel">
+    <div class="grid">
+      <div><label for="owner">Owner (user or org)</label><input id="owner" type="text" placeholder="your-username"></div>
+      <div><label for="repo">Repository</label><input id="repo" type="text" placeholder="my-repo"></div>
+      <div><label for="branch">Branch</label><input id="branch" type="text" value="main"></div>
+      <div><label for="path">File path</label><input id="path" type="text" placeholder="notes/list.txt"></div>
+    </div>
+    <div class="grid" style="margin-top:10px">
+      <div><label for="token">Personal access token</label><input id="token" type="password" placeholder="github_pat_..."></div>
+    </div>
+    <div class="row">
+      <button id="loadBtn">Load file</button>
+      <label class="check"><input id="remember" type="checkbox"> Remember token on this device</label>
+    </div>
+  </div>
+
+  <div class="panel">
+    <textarea id="editor" placeholder="Load a file, or type here and Save to create a new one." spellcheck="false"></textarea>
+    <div class="row">
+      <input id="message" type="text" placeholder="Commit message (optional)" style="flex:1; min-width:200px">
+      <button id="saveBtn">Save to GitHub</button>
+      <button id="reloadBtn" class="secondary">Discard changes</button>
+    </div>
+    <div class="row"><span id="status">Not loaded.</span></div>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const FIELDS = ['owner', 'repo', 'branch', 'path'];
+let sha = null;        // version of the file we loaded; GitHub needs it to update
+let dirty = false;
+
+// ---------- settings ----------
+function loadSettings() {
+  try {
+    const s = JSON.parse(localStorage.getItem('ghEditor') || '{}');
+    FIELDS.forEach(f => { if (s[f]) $(f).value = s[f]; });
+    if (s.token) { $('token').value = s.token; $('remember').checked = true; }
+  } catch (e) {}
+}
+function saveSettings() {
+  try {
+    const s = {};
+    FIELDS.forEach(f => s[f] = $(f).value.trim());
+    if ($('remember').checked) s.token = $('token').value.trim();
+    localStorage.setItem('ghEditor', JSON.stringify(s));
+  } catch (e) {}
+}
+
+// ---------- helpers ----------
+function setStatus(msg, kind = '') { const el = $('status'); el.textContent = msg; el.className = kind; }
+
+function textToB64(str) {               // UTF-8 safe
+  const bytes = new TextEncoder().encode(str);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+function b64ToText(b64) {
+  const bin = atob(b64.replace(/\n/g, ''));
+  return new TextDecoder().decode(Uint8Array.from(bin, c => c.charCodeAt(0)));
+}
+
+function cfg() {
+  const c = {};
+  FIELDS.concat('token').forEach(f => c[f] = $(f).value.trim());
+  for (const f of ['owner', 'repo', 'path', 'token']) if (!c[f]) throw new Error(`Fill in "${f}".`);
+  c.branch = c.branch || 'main';
+  return c;
+}
+
+async function gh(method, body) {
+  const c = cfg();
+  const filePath = c.path.replace(/^\/+/, '').split('/').map(encodeURIComponent).join('/');
+  let url = `https://api.github.com/repos/${encodeURIComponent(c.owner)}/${encodeURIComponent(c.repo)}/contents/${filePath}`;
+  if (method === 'GET') url += `?ref=${encodeURIComponent(c.branch)}`;
+  const res = await fetch(url, {
+    method,
+    cache: 'no-store',
+    headers: {
+      'Accept': 'application/vnd.github+json',
+      'Authorization': `Bearer ${c.token}`,
+      'X-GitHub-Api-Version': '2022-11-28',
+      ...(body ? { 'Content-Type': 'application/json' } : {})
+    },
+    body: body ? JSON.stringify({ ...body, branch: c.branch }) : undefined
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) { const e = new Error(`${res.status}: ${data.message || res.statusText}`); e.status = res.status; throw e; }
+  return data;
+}
+
+// ---------- actions ----------
+async function loadFile() {
+  if (dirty && !confirm('You have unsaved changes. Load anyway?')) return;
+  saveSettings();
+  setStatus('Loading…');
+  try {
+    const data = await gh('GET');
+    if (Array.isArray(data)) throw new Error('That path is a folder, not a file.');
+    if (!data.content && data.size > 0) throw new Error('File is over 1 MB; the Contents API won\'t return it.');
+    $('editor').value = data.content ? b64ToText(data.content) : '';
+    sha = data.sha; dirty = false;
+    setStatus(`Loaded ${data.path} (${data.size} bytes).`, 'ok');
+  } catch (e) {
+    if (e.status === 404) { sha = null; setStatus('File not found (or no access). Saving will create it.', 'err'); }
+    else setStatus(e.message, 'err');
+  }
+}
+
+async function saveFile() {
+  saveSettings();
+  $('saveBtn').disabled = true;
+  setStatus('Saving…');
+  try {
+    const c = cfg();
+    const body = {
+      message: $('message').value.trim() || `Update ${c.path}`,
+      content: textToB64($('editor').value)
+    };
+    if (sha) body.sha = sha;              // omit sha to create a new file
+    const data = await gh('PUT', body);
+    sha = data.content.sha; dirty = false;
+    $('message').value = '';
+    setStatus(`Saved — commit ${data.commit.sha.slice(0, 7)}.`, 'ok');
+  } catch (e) {
+    if (e.status === 409 || e.status === 422) setStatus(`${e.message} — the file changed on GitHub since you loaded it. Copy your text, reload, and re-apply.`, 'err');
+    else setStatus(e.message, 'err');
+  } finally {
+    $('saveBtn').disabled = false;
+  }
+}
+
+// ---------- wiring ----------
+$('loadBtn').onclick = loadFile;
+$('saveBtn').onclick = saveFile;
+$('reloadBtn').onclick = () => { dirty = false; loadFile(); };
+$('editor').addEventListener('input', () => { dirty = true; setStatus('Unsaved changes.'); });
+$('remember').addEventListener('change', () => { if (!$('remember').checked) saveSettings(); });
+document.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); saveFile(); }
+});
+window.addEventListener('beforeunload', e => { if (dirty) { e.preventDefault(); e.returnValue = ''; } });
+loadSettings();
+</script>
+</body>
+</html>
